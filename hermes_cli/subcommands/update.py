@@ -112,4 +112,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Update code and dependencies but defer the fleet restart. Use for updates "
              "running inside a gateway cgroup, then restart gateways separately.",
     )
+    update_parser.add_argument(
+        "--verbose", action="store_true", default=False,
+        help="Print detailed update substeps (git fetches, PM preparation, build steps) to the "
+             "terminal and logs/update.log. The default output keeps one timestamped line per "
+             "main stage.",
+    )
     update_parser.set_defaults(func=cmd_update)

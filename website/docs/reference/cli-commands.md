@@ -112,7 +112,7 @@ The install also ships `hermes-agent`, a minimal runner that sends one query and
 | `hermes profile` | Manage profiles — multiple isolated Hermes instances. |
 | `hermes completion` | Print shell completion scripts (bash/zsh/fish). |
 | `hermes --version` | Show version information. |
-| `hermes update` | Update to the latest stable release (or the selected channel) and reinstall dependencies. `--check` previews without installing; `--backup` takes a pre-pull `HERMES_HOME` snapshot. |
+| `hermes update` | Update to the latest stable release (or the selected channel) and reinstall dependencies. `--check` previews without installing; `--backup` takes a pre-pull `HERMES_HOME` snapshot; `--verbose` streams detailed substeps to the terminal and `logs/update.log`. |
 | `hermes uninstall` | Remove Hermes from the system. |
 
 ## `hermes chat`

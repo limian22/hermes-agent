@@ -134,6 +134,35 @@ For an admitted source checkout, `hermes update` runs these phases:
 7. **Gateway auto-restart**: before any gateway starts, the update rewrites each profile's gateway service definition (systemd unit, stopped launchd job's plist, Windows launcher scripts) that no longer matches the updated install. On Linux and macOS, gateways paused for the update are started again as soon as the dependencies are prepared and those definitions rewritten, before the product builds; on Windows they restart after the builds. Any other running gateway is refreshed after the update completes. Service-managed gateways (systemd on Linux, launchd on macOS) restart through the service manager. Manual gateways are relaunched when Hermes can map their PID to a profile. Manually launched `hermes serve` / `hermes dashboard` backends are different: the updater leaves them running and asks their owner to restart them. See [Manual backend restart reminders](#manual-backend-restart-reminders). Backends owned by a running Desktop app remain the app's responsibility.
 8. **Multiplex migration (multi-profile installs)** — once the fleet is verified on the new code, an install with two or more profiles that still run **one gateway per profile** is folded into a single multiplexed default gateway when nothing blocks it (same as `hermes gateway migrate --multiplex --yes`); if a blocker exists (a bot token shared by two profiles, a secondary profile binding a port with no `/p/<profile>/` ingress) the update prints the blockers with their fixes and changes nothing. Single-profile installs are never touched. See [Migrating from per-profile gateways](../user-guide/multi-profile-gateways.md#migrating-from-per-profile-gateways).
 
+### Update progress and timing
+
+`hermes update` prints one concise, timestamped line per main stage, with monotonic
+elapsed time and the run total:
+
+```text
+[14:03:12] ▶ Fetching updates
+[14:03:18] ✓ Fetching updates — 6.4s · total 8.1s
+[14:03:18] ▶ Updating dependencies
+[14:04:02] ✓ Updating dependencies — 44.0s · total 52.1s
+```
+
+The stages are planning, backup, fetch/apply, dependencies, build, restart and
+verification. When a stage produces no output for 20 seconds, the updater prints an
+honest waiting line (`… still running — 34.2s · no output for 34.2s`) and repeats it
+at most once a minute. It never invents a percentage.
+
+Pass `--verbose` to add detailed substeps (the git target/fetch/commit count, PM and
+build output) to the terminal and `~/.hermes/logs/update.log`. Without it, child
+output stays behind the existing PM progress policy; the default stage lines remain
+the whole terminal view. Credential-shaped text is redacted from timing substeps.
+
+The same timing is written to the update receipt: each existing stage mark gains
+`started_at` and `duration_ms`, and the receipt gains one `timing` summary. The
+post-commit completion child inherits the run's monotonic total through its existing
+request file, so a slow build does not restart the clock at the hand-off. Success,
+failure and interruption all print a final slow-step summary; the receipt keeps the
+timing even when the terminal is gone.
+
 ### Gateway downtime during an update
 
 On Linux and macOS, `hermes update` stops every gateway running from this install right before it first changes the checkout, and starts exactly that set again on the new code once the dependencies are prepared (before the web UI, TUI and Desktop builds, which can take minutes). Your bots are offline for that window: typically the git update plus the dependency sync. Before this, a gateway kept running old code while git rewrote the files under it, and any module it imported lazily in that window came from the new code.

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import NoReturn
 from hermes_cli.cli_output import line_input
 from hermes_cli.process_identity import is_desktop_owned_backend as _is_desktop_owned_backend
+from hermes_cli import update_timing as _update_timing
 
 _PRE_BUILD_HINT = "  Pre-build first:  pnpm install --frozen-lockfile --filter web... && pnpm --dir web run build"
 
@@ -482,6 +483,8 @@ class _UpdateOutputStream:
         self._original_broken = False
 
     def write(self, data):
+        # Real output (including a CR redraw from a child) is activity, not silence.
+        _update_timing.note_output()
         # Mirror to the log file first — it's the most reliable destination.
         if self._log is not None:
             with contextlib.suppress(Exception):

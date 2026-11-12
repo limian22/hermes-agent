@@ -118,6 +118,8 @@ def transition(tmp_path):
                  package / "source_completion.py")
     shutil.copy2(Path(update_completion.__file__).with_name("update_lock.py"),
                  package / "update_lock.py")
+    shutil.copy2(Path(update_completion.__file__).with_name("update_timing.py"),
+                 package / "update_timing.py")
     shutil.copy2(Path(update_completion.__file__).with_name("_startup_fast.py"), package / "_startup_fast.py")
     shutil.copy2(Path(update_completion.__file__).with_name("_subprocess_compat.py"),
                  package / "_subprocess_compat.py")

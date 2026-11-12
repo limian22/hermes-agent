@@ -27,6 +27,7 @@ from hermes_cli.update_completion import run_completion
 from hermes_cli.update_channel import adopt_retired_channel
 from pm.receipt import accept_worker_receipt as _accept_completion_pm_receipt
 from hermes_cli import update_receipt as _completion_receipt, update_cmd_config as _completion_config
+from hermes_cli import update_timing as _update_timing
 from hermes_cli._old_updater import stop_for_relaunch
 from hermes_cli._early_recovery import git_operation_in_progress, interrupted_pull_marker, is_object_id
 from hermes_cli import update_cmd_commit as _commit
@@ -703,6 +704,7 @@ def _source_completion_request(opts, plan, snapshot_id, windows_resume, desktop,
         "home": str(get_hermes_home()), "branch": "main", "desktop": desktop,
         "assume_yes": opts.assume_yes, "gateway_mode": gateway_mode,
         "no_gateway_restart": getattr(opts, "no_gateway_restart", False),
+        "verbose": bool(getattr(opts, "verbose", False)),
         "pre_update_version": opts.pre_update_version, "snapshot_id": snapshot_id,
         "sibling_snapshots": deepcopy(_completion_config._LAST_SIBLING_SNAPSHOTS),
         "plan": plan.to_dict() if plan is not None else None,
@@ -757,6 +759,8 @@ def _complete_source_update(request: dict | None) -> None:
         "apply", "skipped" if request.get("completion_message") else "success", mode=request.get("apply_mode", "git"))
     from hermes_cli.update_stage import publish_stage
     publish_stage("Updating dependencies")  # the completion below starts with the dependency sync
+    # Hand the monotonic run clock to the child through its existing request file.
+    request["timing"] = _update_timing.export_state()
     current = _completion_receipt._current.get()
     if current is not None:
         request["receipt"] = deepcopy(current.data)
@@ -770,6 +774,7 @@ def _complete_source_update(request: dict | None) -> None:
         result = run_completion(request)
     except KeyboardInterrupt as interrupt:
         # Ctrl-C after the commit point: the tree is new, so the run is interrupted, never "failed".
+        _update_timing.finish_run("interrupted")
         _completion_receipt.finalize_interrupted_update_receipt("KeyboardInterrupt: interrupted after the code was updated")
         raise SystemExit(130) from interrupt
     except Exception as exc:  # health: allow BLE001 -- after the commit point a lost completion is owed, never a failed update (C3)
@@ -781,6 +786,9 @@ def _complete_source_update(request: dict | None) -> None:
         # without a correlated terminal receipt to non-zero): the same owed tail (review P2).
         result, lost = settle_lost_completion(
             request, result.get("error") or f"the completion process exited {result['exit_code']}"), True
+    # The child's stage marks are the rest of this run's timeline; fold their durations into
+    # this process's final summary (the monotonic total already includes the wait).
+    _update_timing.absorb_receipt(result.get("receipt"))
     _accept_completion_pm_receipt(result.get("pm_receipt"), request["receipt"]["update_id"])
     if result.get("receipt") is not None:
         # The child closed the run: drop the stale pre-child context before anything below can
@@ -1482,6 +1490,7 @@ class _UpdateOptions:
     switch_branch: bool
     discard_local_changes: bool
     no_gateway_restart: bool = False
+    verbose: bool = False
 
 
 def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
@@ -1503,6 +1512,7 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
     # and dependencies but defer the fleet restart so the updater is not killed
     # by its own restart. The pending-restart marker is kept for catch-up.
     no_gateway_restart = bool(getattr(args, "no_gateway_restart", False))
+    verbose = bool(getattr(args, "verbose", False))
 
     # Interactive terminals always stash-and-ask; only non-interactive updates consult
     # updates.non_interactive_local_changes (auto-restore vs discard).
@@ -1516,7 +1526,7 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
         pre_update_version=pre_update_version,
         gw_input_fn=gw_input_fn, assume_yes=assume_yes, keep_stash=keep_stash,
         switch_branch=switch_branch, discard_local_changes=discard_local_changes,
-        no_gateway_restart=no_gateway_restart)
+        no_gateway_restart=no_gateway_restart, verbose=verbose)
 
 
 def _begin_update_receipt_and_plan(args):
@@ -1685,6 +1695,7 @@ def _handle_update_called_process_error(
             _print_called_process_error_tail(e)
         if stop := _completion_receipt.git_error_stop_class(e):
             _record_stop(stop)
+        _update_timing.finish_run("failed")
         _finalize_receipt("failed", 'Update receipt finalize failed: %s')
         sys.exit(1)
 
@@ -1736,6 +1747,8 @@ def _apply_pulled_update(
     post_pull_sha = _verify_head_after_pull(
         git_cmd, branch, movement_baseline, in_place_update=_plan.in_place_update,
         _windows_gateway_resume=_windows_gateway_resume)
+    if post_pull_sha:
+        _update_timing.substep(f"HEAD now {post_pull_sha[:10]}")
 
     if completion_request is not None:
         observed = _capture_head_sha(git_cmd, _m().PROJECT_ROOT) or post_pull_sha
@@ -1769,6 +1782,22 @@ def _update_run_channel(args) -> str:
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
+    """Run the update body and close its timing on every exit, including sys.exit."""
+    outcome, code = "success", 0
+    try:
+        return _cmd_update_impl_body(args, gateway_mode)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        outcome = "success" if code == 0 else "interrupted" if code == 130 else "failed"
+        raise
+    except BaseException as exc:
+        outcome = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+        raise
+    finally:
+        _update_timing.finish_run(outcome)
+
+
+def _cmd_update_impl_body(args, gateway_mode: bool):
     """Apply the update; the command boundary owns errors, receipts and stdio."""
     # Marks this frame as the CURRENT updater for
     # _old_updater.in_historical_update(); historical on-disk updaters do not
@@ -1805,12 +1834,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     print("☤ Updating Hermes Agent...")
     print()
+    _update_timing.configure(verbose=opts.verbose)
+    _update_timing.start_run()
 
+    _update_timing.begin_stage("plan")
     _pre_update_plan = _begin_update_receipt_and_plan(args)
 
     # Backup before any git/file mutation; the snapshot id (None if disabled/failed) feeds
     # the post-update cron-jobs safety net. A deliberate opt-out is recorded as a skip with its
     # reason, not as a failed step (see _record_pre_update_backup_outcome).
+    _update_timing.begin_stage("snapshot")
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
     _record_pre_update_backup_outcome(args, pre_update_snapshot_id)
     _record_snapshot_stage(args, pre_update_snapshot_id)
@@ -1829,6 +1862,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         or _m()._desktop_dist_exists(desktop_dir)
         or bool(_m()._installed_desktop_apps()))
 
+    _update_timing.begin_stage("apply")
     use_zip_update, git_cmd, is_fork = _prepare_git_command(checkout_move=_moves_for(_windows_gateway_resume))
 
     completion_request = _source_completion_request(
@@ -1840,6 +1874,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         args, branch, completion_request, git_cmd=None if use_zip_update else git_cmd,
         stop=lambda: _m()._resume_windows_gateways_after_update(_windows_gateway_resume))
     branch = completion_request["branch"]
+    _update_timing.substep(f"target {branch} at {target_ref or 'HEAD'}")
 
     if use_zip_update:
         try:
@@ -1887,6 +1922,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             fetch_result = subprocess.CompletedProcess([], 0)
         else:
             print("→ Fetching updates...")
+            _update_timing.substep(f"git fetch {target_ref or branch}")
             fetch_result = fetch_with_partial_clone_recovery(
                 lambda gc, a: _git_run(gc, a, network=True), git_cmd, fetch_args, _m().PROJECT_ROOT)
         if fetch_result.returncode != 0:
@@ -1900,6 +1936,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
         _check.fetch_release_tag(git_cmd, _m().PROJECT_ROOT, completion_request)
+        _update_timing.substep(f"fetched {target_ref or branch}")
         current_branch = _current_branch_name(git_cmd, check=True)
         _commit.record_run_start(git_cmd, _m().PROJECT_ROOT)
         held_message = None
@@ -1925,8 +1962,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         if release_sha:
             print(f"→ Switching to source commit {release_sha[:10]}")
+            _update_timing.substep(f"release commit {release_sha}")
         elif commit_count > 0:
             print(f"→ Found {commit_count} new commit(s)")
+            _update_timing.substep(f"{commit_count} new commit(s) on {branch}")
         elif _plan.switched_without_new_commits:
             print(f"→ Switched the running checkout to {branch} (no new commits to count)")
         else:

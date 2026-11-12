@@ -112,6 +112,12 @@ def _complete_locked(
     def step(name: str, run) -> None:
         # Each step is independent: a failed launcher publish or web build must not skip the
         # config migration, the maintenance, or (in an update) the gateway restart after it.
+        from hermes_cli import update_timing
+
+        timed = name == "build"
+        before = len(owed)
+        if timed:
+            update_timing.begin_stage("build")
         try:
             run()
         except (Exception, SystemExit) as exc:  # health: allow BLE001 -- reported as an owed follow-up
@@ -120,6 +126,11 @@ def _complete_locked(
             reason = str(exc) or type(exc).__name__
             record_followup(name, reason)
             owed.append((name, reason))
+        finally:
+            # The receipt's build mark lands after maintenance; this span keeps the printed/
+            # summary duration on the build itself and leaves facts for that mark.
+            if timed:
+                update_timing.end_stage("build", "failed" if len(owed) > before else "success")
 
     step("launchers", lambda: publish_launchers(root))
     step("build", lambda: build_update_products(root, desktop=desktop, after_dependencies=after_dependencies))

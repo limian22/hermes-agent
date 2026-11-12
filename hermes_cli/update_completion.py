@@ -74,6 +74,9 @@ def run_completion(request: dict) -> dict:
                         "from pm.libatomic import install_before_lock; install_before_lock()", str(root)],
                        cwd=root, stdout=None, stderr=subprocess.DEVNULL, check=False)
     env = dict(os.environ, HERMES_HOME=request["home"], PYTHONUNBUFFERED="1")
+    if request.get("verbose"):
+        # Existing long-child policy: PM/uv/npm progress streams into the parent's update.log.
+        env["HERMES_VERBOSE"] = "1"
     for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
         env.pop(key, None)
     with tempfile.TemporaryDirectory(prefix="hermes-completion-") as directory:
@@ -311,6 +314,9 @@ def _settle_after_commit(request: dict, result_path: Path, step: str, reason: st
                                        if step == "dependencies" else "the next launch or `hermes update` retries it")
         if not _record_owed_user_action(request):
             print(_owed_user_action(request))  # the completion child that would print it never ran
+        from hermes_cli import update_timing
+
+        update_timing.finish_run("success", summary=False)
         update_receipt.finalize_pending_update_receipt(0, f"{step} owed after the code was updated")
         receipt = _read_terminal_receipt(request)
     code = 0 if receipt is not None and receipt.get("outcome") == "success" else 1
@@ -359,6 +365,8 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
             collect_superseded_generations(root)
         finally:
             request["pm_receipt"] = receipt.last_for_update(update_id)
+            from hermes_cli import update_timing as _timing
+            request["timing"] = _timing.export_state()
             _write_json(request_path, request)
     # -X utf8 like the bootstrap child: -I ignores PYTHONIOENCODING, and this child prints ✓/⚠
     # (the follow-up protocol) into the parent's pipe, whatever the console code page.
@@ -370,8 +378,11 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     # and dependency graph. No application maintenance runs in this bootstrap.
     from hermes_cli.update_lock import checkout_lock_fds
 
+    child_env = activation_environment(root)
+    if request.get("verbose"):
+        child_env["HERMES_VERBOSE"] = "1"
     # health: allow HX006 -- the prepared completion child is the update's build; it runs to the end
-    code = _exit_status(subprocess.call(command, cwd=root, env=activation_environment(root),
+    code = _exit_status(subprocess.call(command, cwd=root, env=child_env,
                                         pass_fds=checkout_lock_fds(root)))
     if not result_path.exists():
         return _settle_after_commit(request, result_path, "completion",
@@ -389,6 +400,7 @@ def _complete_selected(request: dict) -> bool:
     retries that, so the run is ``partial`` and exits 1 (#122557), never "Update complete".
     """
     from hermes_cli import main, update_cmd, update_cmd_config
+    from hermes_cli import update_timing
     from hermes_cli.source_completion import complete_source_checkout
     from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
     from hermes_cli.update_launch_files import refresh_launch_files
@@ -444,6 +456,7 @@ def _complete_selected(request: dict) -> bool:
     # the user's own changes are still parked.
     if request["gateway_mode"]:
         update_cmd._write_gateway_update_exit_code(complete)
+    update_timing.begin_stage("restart")
     if request.get("no_gateway_restart", False):
         record_skip("gateway_restart", "--no-gateway-restart: deferred, marker kept")
         record_stage("restart", "skipped")
@@ -463,9 +476,11 @@ def _complete_selected(request: dict) -> bool:
     restart = update_cmd._restart_gateway_fleet_after_update(plan, request["gateway_mode"])
     record_stage("restart", "failed" if getattr(restart, "incomplete", False) else "success")
     update_cmd._resume_windows_gateways_and_merge_outcome(restart, request["windows_resume"], request["gateway_mode"])
+    update_timing.begin_stage("verify")
     update_cmd._verify_fleet_after_update(
         restart, _pre_update_plan=plan, _windows_gateway_resume=request["windows_resume"],
         update_complete=bool(runtime_safe) and complete)
+    update_timing.end_stage("verify", "success")
     return complete
 
 
@@ -510,7 +525,7 @@ def _report_unbuilt_desktop(request: dict) -> None:
 
 
 def _finish(request: dict, result_path: Path) -> int:
-    from hermes_cli import update_receipt
+    from hermes_cli import update_receipt, update_timing
     from pm.receipt import accept_worker_receipt
 
     _resume_receipt(request["receipt"])
@@ -524,6 +539,7 @@ def _finish(request: dict, result_path: Path) -> int:
         # An operator interrupt is not a step failure, and the code already moved: the run is
         # ``interrupted`` (never "failed"), and the armed obligations finish the tail.
         code, reason = 130, "KeyboardInterrupt: interrupted after the code was updated"
+        update_timing.finish_run("interrupted", summary=False)
         update_receipt.finalize_interrupted_update_receipt(reason, exit_code=code)
     except SystemExit as exc:
         if exc.code not in (0, None):
@@ -533,6 +549,9 @@ def _finish(request: dict, result_path: Path) -> int:
         _report_unbuilt_desktop(request)
         update_receipt.record_followup("completion", f"{type(exc).__name__}: {exc}")
     finally:
+        update_timing.finish_run(
+            "interrupted" if code == 130 else "success" if code == 0 else "failed",
+            summary=False)
         custody = sys.modules.get("hermes_cli.update_custody")
         refusal = custody.refusal_notice() if code and custody is not None else None
         if refusal:  # m2: what stopped it, whatever error the refusal turned into downstream
@@ -573,6 +592,8 @@ def main() -> int:
     # -I deliberately ignores inherited PYTHONPATH during PM preparation.
     sys.path.insert(0, str(root))
     sys.stdout = _ForwardedOutput(sys.stdout, request.get("stdout_isatty", False))
+    from hermes_cli import update_timing
+    update_timing.adopt_handoff(request)
     if "--prepared" in sys.argv[3:]:
         # Claim the selected generation's lease and process its .pth files only
         # after PM selection, before importing any application dependencies.
@@ -584,11 +605,15 @@ def main() -> int:
 
 def _bootstrap(request: dict, request_path: Path, result_path: Path) -> int:
     """Dependency preparation in the parent's interpreter; its failure is a follow-up (A6)."""
+    from hermes_cli import update_timing
+
+    update_timing.begin_stage("deps")
     try:
         return _prepare(request, request_path, result_path)
     except KeyboardInterrupt:
         _resume_receipt(request["receipt"])
         from hermes_cli import update_receipt
+        update_timing.finish_run("interrupted", summary=False)
         update_receipt.finalize_interrupted_update_receipt(
             "KeyboardInterrupt: interrupted while installing dependencies", exit_code=130)
         return _write_bootstrap_result(request, result_path, 130, _read_terminal_receipt(request))

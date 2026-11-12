@@ -503,6 +503,12 @@ def record_skip(name: str, reason: str) -> None:
 
 def record_stage(name: str, outcome: str, **facts: str) -> None:
     """Mark the END of a pipeline stage (``success``/``failed``/``skipped``) with a timestamp."""
+    # One timeline: the console/log line and this mark share the same span. A stage
+    # timed in another process (the completion child) contributes its exported facts.
+    with suppress(Exception):
+        from hermes_cli.update_timing import stage_end_facts
+
+        facts = {**stage_end_facts(name, outcome), **facts}
     _record("stage", f"update stage {name}", name, outcome, **facts)
     # Each stage boundary refreshes the durable running record (a kill names its last stage).
     persist_running_receipt()
